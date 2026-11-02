@@ -393,7 +393,7 @@ async function init() {
   const fadeMats = new Map();
   gRear.traverse((o) => {
     if (!o.isMesh) return;
-    if (!fadeMats.has(o.material)) { const m = o.material.clone(); m.transparent = true; m.userData.baseSide = m.side; m.userData.inner = o.material === MAT.shellInner || o.material.side === THREE.BackSide; fadeMats.set(o.material, m); }
+    if (!fadeMats.has(o.material)) { const m = o.material.clone(); m.transparent = false; m.userData.baseSide = m.side; m.userData.inner = o.material === MAT.shellInner || o.material.side === THREE.BackSide; fadeMats.set(o.material, m); }
     o.material = fadeMats.get(o.material);
   });
   parts.rearCase.fadeMats = [...fadeMats.values()];
@@ -920,7 +920,6 @@ function frame(now, manualDt) {
     if (mouseCord) { const plugged = parts.rearCase.t < 0.004 && parts.logic.t < 0.004; if (mouseCord.visible !== plugged) { mouseCord.visible = plugged; sound.click(); } }
     updatePower(dt);
     updateCentering(dt);
-    updateOcclusion(dt);
     updateHover();
   }
   updateFlight(dt);
