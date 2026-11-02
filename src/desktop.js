@@ -6,6 +6,7 @@ import { Gfx, PAT, W, H, ICONS, CURSORS } from './gfx.js';
 import { DESK_ACCESSORIES, PaintApp, WriteApp, README_TEXT, samplePainting } from './apps.js';
 
 export const MB = 20, TB = 19, INFO = 18, SB = 16;
+const LIST_COLS = [8, 150, 196, 290]; // Name, Size, Kind, Last Modified in a list view
 const LAUNCH = new Date(1984, 0, 24, 9, 41);
 
 let NEXT = 1;
@@ -18,7 +19,7 @@ export class Desktop {
     this.fb = fb; this.g = new Gfx(fb, W, H, 0); this.hooks = hooks;
     this.state = 'off'; this.t = 0; this.dirty = true;
     this.mouse = { x: 256, y: 171, down: false, seen: false };
-    this.settings = { volume: 4, dbl: 1, blink: 1, pattern: PAT.gray.slice(), tracking: 1 };
+    this.settings = { volume: 4, dbl: 1, blink: 1, pattern: PAT.gray.slice(), tracking: 1, menuBlink: 2 };
     this.clipboard = null;
     this.buildFiles();
     this.windows = []; this.sel = new Set(); this.app = null;
@@ -52,6 +53,8 @@ export class Desktop {
     disk.parent = this.desk; trash.parent = this.desk;
   }
   sizeOf(it) { return it.children ? it.children.reduce((s, c) => s + this.sizeOf(c), 0) : it.size; }
+  hasLocked(it) { return !!it.locked || !!it.children?.some((c) => this.hasLocked(c)); }
+  hasApp(kind) { const find = (p) => p.children?.some((c) => (c.type === 'app' && c.app === kind) || find(c)); return find(this.desk); }
   diskUsed() { return this.sizeOf(this.disk) + this.sizeOf(this.trash) + this.desk.children.filter((c) => c !== this.disk && c !== this.trash).reduce((s, c) => s + this.sizeOf(c), 0); }
   where(it) { const p = []; let q = it.parent; while (q && q.type !== 'desktop') { p.unshift(q.name); q = q.parent; } return p.length ? p.join(', ') : 'desktop'; }
   uniqueName(parent, base) { let n = base, i = 2; while (parent.children.some((c) => c.name === n)) n = `${base} ${i++}`; return n; }
@@ -81,7 +84,7 @@ export class Desktop {
         this.state = 'run'; this.dirty = true;
         if (!this.windows.length && !this.everBooted) this.openContainer(this.disk, true);
         this.everBooted = true;
-        if (this.startupApp) this.after(0.5, () => this.launch(this.startupApp, null, null));
+        if (this.startupApp && this.hasApp(this.startupApp)) this.after(0.5, () => this.launch(this.startupApp, null, null));
       }
       return;
     }
@@ -96,7 +99,7 @@ export class Desktop {
     if (this.menu.flash) { this.dirty = true; if (this.t >= this.menu.flash.until) { const f = this.menu.flash; this.menu.flash = null; this.closeMenu(); f.run(); } }
     if (this.menu.titleFlash && this.t >= this.menu.titleFlash.until) { this.menu.titleFlash = null; this.dirty = true; }
     if (this.busyUntil && this.t >= this.busyUntil) { this.busyUntil = 0; this.dirty = true; }
-    if (this.track?.type === 'scroll' && this.t >= this.track.next) { this.track.next = this.t + 0.06; this.scrollBy(this.track.win, this.track.dy); }
+    if (this.track?.type === 'scroll' && this.track.dy && this.t >= this.track.next) { this.track.next = this.t + 0.06; this.scrollBy(this.track.win, this.track.dy); }
     for (const w of this.windows) if (w.da?.tick?.(dt)) this.dirty = true;
     if (this.app?.tick?.(dt)) this.dirty = true;
   }
@@ -132,7 +135,7 @@ export class Desktop {
         { label: 'Select All', key: 'A', action: () => (daEdit('selectAll') ? front.da.edit('selectAll', this) : this.selectAll()) }, '-',
         { label: 'Show Clipboard', action: () => this.showClipboard() },
       ] },
-      { title: 'View', items: ['icon', 'name', 'date', 'size', 'kind'].map((v) => ({ label: `by ${v[0].toUpperCase()}${v.slice(1)}`, enabled: () => !!view, check: () => view === v, action: () => { front.view = v; front.scrollY = 0; } })) },
+      { title: 'View', items: ['icon', 'name', 'date', 'size', 'kind'].map((v) => ({ label: `by ${v[0].toUpperCase()}${v.slice(1)}`, enabled: () => !!view, check: () => view === v, action: () => { front.view = v; front.scrollY = 0; if (v !== 'icon') this.fitList(front); } })) },
       { title: 'Special', items: [
         { label: 'Clean Up', action: () => this.cleanUp() },
         { label: 'Empty Trash', enabled: () => this.trash.children.length > 0, action: () => this.emptyTrash() },
@@ -141,7 +144,27 @@ export class Desktop {
       ] },
     ];
   }
-  menus() { return [this.appleMenu(), ...(this.app ? this.app.menus() : this.finderMenus())]; }
+  menus() { return [this.appleMenu(), ...(this.app ? this.appMenus() : this.finderMenus())]; }
+  // the desk accessory window that is in front and has the focus, if any
+  activeDA() { const f = this.front(); return f?.kind === 'da' && !this.appFocused() && !this.dialog ? f : null; }
+  // While a desk accessory is active over an application, the standard Edit commands and
+  // File > Close belong to the desk accessory, not to the document underneath.
+  appMenus() {
+    const ms = this.app.menus(), w = this.activeDA();
+    if (!w) return ms;
+    const da = w.da, CMDS = { Cut: 'cut', Copy: 'copy', Paste: 'paste', Clear: 'clear', 'Select All': 'selectAll' };
+    return ms.map((m) => {
+      if (m.title === 'Edit') {
+        return { ...m, items: m.items.map((it) => {
+          if (it === '-') return it;
+          const cmd = CMDS[it.label];
+          return cmd ? { ...it, enabled: () => !!da.canEdit?.(cmd), action: () => da.edit(cmd, this) } : { ...it, enabled: false };
+        }) };
+      }
+      if (m.title === 'File') return { ...m, items: m.items.map((it) => (it !== '-' && it.label === 'Close' ? { ...it, enabled: true, action: () => this.closeWindow(w) } : it)) };
+      return m;
+    });
+  }
   layoutMenus() {
     const ms = this.menus(); let x = 10;
     ms.forEach((m) => { m.w = (m.title === '✱' ? 9 : textWidth(m.title, true)) + 16; m.x = x; x += m.w; });
@@ -168,7 +191,9 @@ export class Desktop {
     const m = this.menu.list[mi], it = m.items[ii];
     if (!this.enabled(it)) { this.closeMenu(); return; }
     this.menu.item = ii;
-    this.menu.flash = { until: this.t + 0.24, run: () => it.action() };
+    // the chosen item blinks 0, 1 or 3 times, as set in the Control Panel
+    const blinks = [0, 1, 3][this.settings.menuBlink ?? 2] ?? 3;
+    this.menu.flash = { until: this.t + blinks * 0.08, run: () => it.action() };
     this.dirty = true;
   }
   shortcut(key) {
@@ -196,6 +221,9 @@ export class Desktop {
     const sb = w.kind === 'folder' ? SB - 1 : 0;
     return { x: w.x + 1, y: top, w: w.w - 2 - sb, h: w.y + w.h - 1 - top - sb };
   }
+  inCloseBox(w, x, y) { return !!w.closable && x >= w.x + 7 && x <= w.x + 20 && y >= w.y + 3 && y <= w.y + 16; }
+  // the row of an item in a folder window shown as a list
+  rowRect(w, it) { const c = this.content(w), i = w.item.children.indexOf(it); return { x: c.x, y: c.y + 16 + i * 16 - w.scrollY, w: c.w, h: 16 }; }
   closeWindow(w, quiet = false) {
     if (!w) return;
     if (w.kind === 'da' && w.da.close) w.da.close(this);
@@ -218,7 +246,8 @@ export class Desktop {
   iconRectOf(it) {
     if (it.parent === this.desk) return { x: it.x, y: it.y, w: 32, h: 32 };
     const w = this.windowFor(it.parent);
-    if (!w || w.view !== 'icon') return w ? { x: w.x + 20, y: w.y + 30, w: 32, h: 32 } : null;
+    if (!w) return null;
+    if (w.view !== 'icon') { const r = this.rowRect(w, it); return { x: r.x + 4, y: r.y, w: Math.max(16, Math.min(140, r.w - 8)), h: 16, row: r, win: w }; }
     const c = this.content(w);
     return { x: c.x + it.x, y: c.y + it.y - w.scrollY, w: 32, h: 32 };
   }
@@ -231,6 +260,11 @@ export class Desktop {
     const x = da.pos ? da.pos[0] : Math.min(W - w - 8, 90 + n * 16), y = da.pos ? da.pos[1] : Math.min(H - h - 8, 50 + n * 14);
     this.windows.push({ kind: 'da', da, title: da.title, closable: true, grow: false, x, y, w, h });
     this.appActive = false; this.dirty = true;
+  }
+  // a list shows four columns; widen a narrow window (as far as the screen allows) so the last one is not cut off
+  fitList(w) {
+    const need = LIST_COLS[3] + textWidth('Last Modified', true) + 8 + 2 + SB - 1;
+    if (w.w < need) { w.w = Math.max(w.w, Math.min(need, W - w.x - 2)); this.scrollBy(w, 0); }
   }
   scrollBy(w, dy) {
     const max = this.scrollMax(w);
@@ -249,7 +283,10 @@ export class Desktop {
   open(it) {
     if (isContainer(it)) return this.openContainer(it);
     if (it.type === 'app') return this.launch(it.app, null, it);
-    if (it.type === 'doc') return this.launch(it.app, it, it);
+    if (it.type === 'doc') {
+      if (!this.hasApp(it.app)) return this.alert('stop', [`“${it.name}” can’t be opened, because the`, 'application that made it can’t be found.'], ['OK']);
+      return this.launch(it.app, it, it);
+    }
     if (it.type === 'note') return this.openDA(DESK_ACCESSORIES.find((D) => D.title === 'Note Pad'));
     if (it.type === 'scrap') return this.openDA(DESK_ACCESSORIES.find((D) => D.title === 'Scrapbook'));
     if (it.type === 'clip') return this.showClipboard();
@@ -268,7 +305,9 @@ export class Desktop {
     if (!this.app) return;
     this.app = null; this.busyUntil = this.t + 0.35; this.dirty = true;
   }
+  // returns the saved item, or null when the document is locked (nothing is written)
   saveDocument(kind, name, data, existing) {
+    if (existing?.locked) { this.alert('stop', [`“${existing.name}” is locked, so the changes`, 'can’t be saved. Unlock it with Get Info.'], ['OK']); return null; }
     let it = existing;
     if (!it) {
       it = mk({ name: this.uniqueName(this.disk, name), type: 'doc', app: kind, icon: kind === 'paint' ? 'picture' : 'document', kind: kind === 'paint' ? 'Paint document' : 'Write document', created: new Date() });
@@ -310,8 +349,14 @@ export class Desktop {
     this.sel.clear(); this.dirty = true;
   }
   emptyTrash() {
-    for (const it of this.trash.children) for (const w of this.windows.filter((w) => w.kind === 'folder' && this.isInside(w.item, it))) this.closeWindow(w, true);
-    this.trash.children = []; this.sel.clear(); this.dirty = true;
+    // locked items stay in the Trash; everything else is deleted, along with any window showing it
+    const keep = this.trash.children.filter((it) => this.hasLocked(it));
+    for (const it of this.trash.children) {
+      if (keep.includes(it)) continue;
+      for (const w of this.windows.filter((w) => (w.kind === 'folder' || w.kind === 'info') && this.isInside(w.item, it))) this.closeWindow(w, true);
+    }
+    this.trash.children = keep; this.sel.clear(); this.dirty = true;
+    if (keep.length) this.alert('caution', ['The Trash contains locked items, which', 'were not deleted.'], ['OK']);
   }
   isInside(a, b) { let q = a; while (q) { if (q === b) return true; q = q.parent; } return false; }
   selectAll() {
@@ -406,7 +451,13 @@ export class Desktop {
     }
     const win = this.windowAt(x, y);
     if (win) { this.appActive = false; return this.windowDown(win, x, y, mods); }
-    if (this.app) { this.appActive = true; this.track = { type: 'app' }; this.app.down(x, y, mods); return; }
+    if (this.app) {
+      this.appActive = true;
+      // the application's document window has a working close box, like every other window
+      const aw = this.app.win;
+      if (aw && this.inCloseBox(aw, x, y)) { this.track = { type: 'close', win: aw, app: this.app, inside: true }; return; }
+      this.track = { type: 'app' }; this.app.down(x, y, mods); return;
+    }
     this.iconsDown(this.desk, null, x, y, mods);
   }
   windowDown(win, x, y, mods) {
@@ -416,7 +467,7 @@ export class Desktop {
       if (!inTitle) return;
     }
     if (inTitle) {
-      if (win.closable && x >= win.x + 7 && x <= win.x + 20 && y >= win.y + 3 && y <= win.y + 16) { this.track = { type: 'close', win, inside: true }; return; }
+      if (this.inCloseBox(win, x, y)) { this.track = { type: 'close', win, inside: true }; return; }
       this.track = { type: 'drag', win, ox: x - win.x, oy: y - win.y, x0: x, y0: y, moved: false };
       return;
     }
@@ -424,9 +475,12 @@ export class Desktop {
       const gx = win.x + win.w - SB, gy = win.y + win.h - SB;
       if (x >= gx && y >= gy) { this.track = { type: 'grow', win, ox: win.x + win.w - x, oy: win.y + win.h - y }; return; }
       if (x >= gx) {
-        const top = win.y + TB - 1;
-        const dy = y < top + SB ? -12 : y >= gy - SB ? 12 : y < top + SB + this.thumbY(win) ? -this.content(win).h : this.content(win).h;
-        if (this.scrollMax(win) > 0) { this.scrollBy(win, dy); this.track = { type: 'scroll', win, dy: Math.abs(dy) === 12 ? dy : 0, next: this.t + 0.35 }; }
+        if (this.scrollMax(win) <= 0) return;
+        const top = win.y + TB - 1, ty = top + SB + this.thumbY(win);
+        // the scroll box can be dragged; arrows scroll by a line (repeating), the gray area by a page
+        if (y >= top + SB && y < gy - SB && y >= ty && y < ty + SB) { this.track = { type: 'thumb', win, off: y - ty }; return; }
+        const dy = y < top + SB ? -12 : y >= gy - SB ? 12 : y < ty ? -this.content(win).h : this.content(win).h;
+        this.scrollBy(win, dy); this.track = { type: 'scroll', win, dy: Math.abs(dy) === 12 ? dy : 0, next: this.t + 0.35 };
         return;
       }
       if (y >= gy) return;
@@ -435,12 +489,16 @@ export class Desktop {
     }
     const c = this.content(win);
     if (win.kind === 'da') { this.track = { type: 'da', win }; win.da.down(x - c.x, y - c.y, mods, this); this.dirty = true; return; }
+    if (win.kind === 'info') { if (this.lockBoxHit(win, c, x, y)) { win.item.locked = !win.item.locked; this.dirty = true; } return; }
     if (win.kind === 'about') this.closeWindow(win);
   }
+  // Get Info: files (not disks or folders) have a Locked check box
+  canLock(it) { return !isContainer(it); }
+  lockBoxHit(win, c, x, y) { return this.canLock(win.item) && x >= c.x + 10 && x < c.x + 72 && y >= c.y + 119 && y < c.y + 135; }
+  thumbRange(win) { return Math.max(0, win.h - TB - SB * 3 + 1 - SB); }
   thumbY(win) {
     const max = this.scrollMax(win); if (!max) return 0;
-    const track = win.h - TB - SB * 3 + 1;
-    return Math.round((win.scrollY / max) * Math.max(0, track - SB));
+    return Math.round((win.scrollY / max) * this.thumbRange(win));
   }
   iconsDown(container, win, x, y, mods) {
     const list = container.children;
@@ -484,7 +542,13 @@ export class Desktop {
     }
     if (!tr) { if (this.app && !this.windowAt(x, y)) this.app.move?.(x, y); return; }
     if (tr.type === 'button') { const inside = rectHit(tr.b, x, y); if (inside !== tr.inside) { tr.inside = inside; this.dirty = true; } }
-    else if (tr.type === 'close') { const w = tr.win, inside = x >= w.x + 7 && x <= w.x + 20 && y >= w.y + 3 && y <= w.y + 16; if (inside !== tr.inside) { tr.inside = inside; this.dirty = true; } }
+    else if (tr.type === 'close') { const inside = this.inCloseBox(tr.win, x, y); if (inside !== tr.inside) { tr.inside = inside; this.dirty = true; } }
+    else if (tr.type === 'thumb') {
+      const w = tr.win, max = this.scrollMax(w), range = this.thumbRange(w), top = w.y + TB - 1;
+      const pos = Math.max(0, Math.min(range, y - tr.off - (top + SB)));
+      const ny = range ? Math.round((pos / range) * max) : 0;
+      if (ny !== w.scrollY) { w.scrollY = ny; this.dirty = true; }
+    }
     else if (tr.type === 'drag' || tr.type === 'icon' || tr.type === 'grow' || tr.type === 'marquee') { if (Math.abs(x - (tr.x0 ?? x)) + Math.abs(y - (tr.y0 ?? y)) > 2) tr.moved = true; this.dirty = true; }
     else if (tr.type === 'da') { const c = this.content(tr.win); tr.win.da.drag?.(x - c.x, y - c.y, this); this.dirty = true; }
     else if (tr.type === 'app') { this.app?.drag?.(x, y, mods); this.dirty = true; }
@@ -501,7 +565,12 @@ export class Desktop {
     const tr = this.track; this.track = null;
     if (!tr) return;
     if (tr.type === 'button') { if (rectHit(tr.b, x, y)) this.dialogButton(tr.b); return; }
-    if (tr.type === 'close') { if (tr.inside) this.closeWindow(tr.win); return; }
+    if (tr.type === 'close') {
+      if (!tr.inside) return;
+      if (tr.app) { if (this.app === tr.app) this.app.close(); } // same as File > Close: asks to save, then back to the Finder
+      else this.closeWindow(tr.win);
+      return;
+    }
     if (tr.type === 'drag') {
       if (tr.moved) { const w = tr.win; w.x = Math.max(-w.w + 40, Math.min(W - 40, x - tr.ox)); w.y = Math.max(MB, Math.min(H - 20, y - tr.oy)); }
       return;
@@ -533,36 +602,49 @@ export class Desktop {
     const over = this.desk.children.find((it) => !dragging.includes(it) && isContainer(it) && this.iconHit(it, null, x, y));
     return over ? { item: over } : { item: this.desk };
   }
+  // where a dragged item starts on screen: its icon, or (dragged out of a list) an icon centred on the pointer
+  dragStart(tr, it, k = 0) {
+    if (!tr.win) return { x: it.x, y: it.y };
+    if (tr.win.view !== 'icon') return { x: tr.x0 - 16 + k * 6, y: tr.y0 - 16 + k * 6 };
+    const o = this.iconOrigin(tr.win);
+    return { x: o.x + it.x, y: o.y + it.y };
+  }
   dropIcons(tr, x, y) {
     const dx = x - tr.x0, dy = y - tr.y0;
     const tgt = this.dropTarget(x, y, tr.items);
     if (!tgt) return;
     const dest = tgt.item;
-    for (const it of tr.items) {
+    const onDesk = (p) => ({ x: Math.max(0, Math.min(W - 40, p.x)), y: Math.max(MB + 2, Math.min(H - 48, p.y)) });
+    let locked = false;
+    tr.items.forEach((it, k) => {
+      const s = this.dragStart(tr, it, k), to = { x: s.x + dx, y: s.y + dy };
       if (it === this.disk || it === this.trash) {
-        if (dest === this.desk) { it.x = Math.max(0, Math.min(W - 40, it.x + dx)); it.y = Math.max(MB + 2, Math.min(H - 48, it.y + dy)); }
+        if (dest === this.desk) Object.assign(it, onDesk(to));
         else this.beep();
-        continue;
+        return;
       }
-      if (dest === it || (it.children && this.isInside(dest, it))) { this.beep(); continue; }
-      if (dest === it.parent && dest !== this.desk && tgt.win) { it.x = Math.max(0, it.x + dx); it.y = Math.max(0, it.y + dy); continue; }
+      if (dest === it || (it.children && this.isInside(dest, it))) { this.beep(); return; }
+      if (this.isInside(dest, this.trash) && !this.isInside(it, this.trash) && this.hasLocked(it)) { locked = true; return; }
+      if (dest === it.parent && dest !== this.desk && tgt.win) {
+        if (tgt.win.view === 'icon') { it.x = Math.max(0, it.x + dx); it.y = Math.max(0, it.y + dy); } // a list keeps its own order
+        return;
+      }
       if (dest === this.desk) {
-        if (it.parent === this.desk) { it.x += dx; it.y += dy; continue; }
-        const o = this.iconOrigin(tr.win);
-        this.moveTo(it, this.desk, Math.max(0, Math.min(W - 40, o.x + it.x + dx)), Math.max(MB + 2, Math.min(H - 48, o.y + it.y + dy)));
-        continue;
+        const p = onDesk(to);
+        if (it.parent === this.desk) Object.assign(it, p); else this.moveTo(it, this.desk, p.x, p.y);
+        return;
       }
-      if (tgt.win) {
+      if (tgt.win && tgt.win.view === 'icon') {
         const c = this.iconOrigin(tgt.win);
-        const o = this.iconOrigin(tr.win);
-        this.moveTo(it, dest, Math.max(0, o.x + it.x + dx - c.x), Math.max(0, o.y + it.y + dy - c.y));
+        this.moveTo(it, dest, Math.max(0, to.x - c.x), Math.max(0, to.y - c.y));
       } else {
         const spot = this.freeSpot(dest);
         this.moveTo(it, dest, spot.x, spot.y);
       }
-    }
+    });
     if (dest === this.trash || !tgt.win) this.sel.clear();
     for (const w of this.windows) if (w.kind === 'folder') this.scrollBy(w, 0);
+    if (locked) this.alert('caution', ['That item is locked, so it can’t be', 'put in the Trash.'], ['OK']);
   }
   key(key, mods = {}) {
     if (this.state !== 'run') return false;
@@ -691,7 +773,14 @@ export class Desktop {
     const right = `${Math.max(0, 400 - used)}K available`, mid = `${used}K in disk`;
     const iy = w.y + TB + 3;
     g.setClip(w.x + 1, w.y + TB, w.w - 2, INFO);
-    g.text(info, w.x + 8, iy); g.text(mid, Math.round(w.x + w.w / 2 - textWidth(mid) / 2), iy); g.text(right, w.x + w.w - 6 - SB - textWidth(right), iy);
+    // in a narrow window the middle and right figures give way rather than print over each other
+    const lx = w.x + 8, lEnd = lx + textWidth(info) + 8;
+    const rx = w.x + w.w - 6 - SB - textWidth(right), mx = Math.round(w.x + w.w / 2 - textWidth(mid) / 2);
+    g.text(info, lx, iy);
+    if (rx >= lEnd) {
+      if (mx >= lEnd && mx + textWidth(mid) + 8 <= rx) g.text(mid, mx, iy);
+      g.text(right, rx, iy);
+    }
     g.noClip();
     g.hline(w.x, w.x + w.w - 1, w.y + TB + INFO - 3); g.hline(w.x, w.x + w.w - 1, w.y + TB + INFO - 1);
     this.drawScrollbars(g, w, active);
@@ -703,7 +792,7 @@ export class Desktop {
       const key = w.view;
       const sorted = [...kids].sort((a, b) => key === 'size' ? this.sizeOf(b) - this.sizeOf(a) : key === 'date' ? b.modified - a.modified : key === 'kind' ? a.kind.localeCompare(b.kind) : a.name.localeCompare(b.name));
       w.item.children.splice(0, kids.length, ...sorted);
-      const cols = [c.x + 8, c.x + 150, c.x + 196, c.x + 290];
+      const cols = LIST_COLS.map((dx) => c.x + dx);
       let y = c.y + 3 - w.scrollY;
       ['Name', 'Size', 'Kind', 'Last Modified'].forEach((h, i) => g.text(h, cols[i], y, { bold: true }));
       y += 16;
@@ -721,6 +810,7 @@ export class Desktop {
     g.text(it.name, c.x + 56, c.y + 14, { bold: true });
     const rows = [['Kind:', it.kind], ['Size:', `${this.sizeOf(it)}K bytes${it.children ? `, ${it.children.length} items` : ''}`], ['Where:', this.where(it)], ['Created:', `${fmtDate(it.created)}, ${fmtTime(it.created)}`], ['Modified:', `${fmtDate(it.modified)}, ${fmtTime(it.modified)}`]];
     rows.forEach(([a, b], i) => { g.text(a, c.x + 12, c.y + 50 + i * 14); g.text(b, c.x + 76, c.y + 50 + i * 14); });
+    if (!this.canLock(it)) return;
     g.frame(c.x + 12, c.y + 122, 10, 10); if (it.locked) { g.line(c.x + 12, c.y + 122, c.x + 21, c.y + 131); g.line(c.x + 21, c.y + 122, c.x + 12, c.y + 131); }
     g.text('Locked', c.x + 28, c.y + 123);
   }
@@ -729,6 +819,18 @@ export class Desktop {
     if (!cb) { g.text('The Clipboard is empty.', c.x + 10, c.y + 10); return; }
     g.text(`Clipboard contains ${cb.type}:`, c.x + 10, c.y + 6, { bold: true });
     if (cb.type === 'text') { const lines = cb.text.split('\n').slice(0, 4); lines.forEach((l, i) => g.text(l.slice(0, 64), c.x + 10, c.y + 24 + i * 12)); }
+    else if (cb.type === 'picture' && cb.bm) {
+      // shrink the picture to fit: a pixel is black if any pixel it stands for is black
+      const bm = cb.bm, maxW = c.w - 20, maxH = c.h - 26;
+      const k = Math.max(1, Math.ceil(Math.max(bm.w / maxW, bm.h / maxH)));
+      const w = Math.ceil(bm.w / k), h = Math.ceil(bm.h / k), x0 = c.x + 10, y0 = c.y + 22;
+      g.frame(x0 - 1, y0 - 1, w + 2, h + 2);
+      for (let j = 0; j < h; j++) for (let i = 0; i < w; i++) {
+        let on = 0;
+        for (let b = 0; b < k && !on; b++) for (let a = 0; a < k; a++) { const sx = i * k + a, sy = j * k + b; if (sx < bm.w && sy < bm.h && bm.data[sy * bm.w + sx]) { on = 1; break; } }
+        if (on) g.px(x0 + i, y0 + j);
+      }
+    }
   }
   drawAbout(g, c) {
     g.fill(c.x + 10, c.y + 10, 120, 140, PAT.ltGray); g.frame(c.x + 10, c.y + 10, 120, 140);
@@ -743,10 +845,14 @@ export class Desktop {
     else if (tr.type === 'grow') g.grayFrame(tr.win.x, tr.win.y, Math.max(120, m.x + tr.ox - tr.win.x), Math.max(90, m.y + tr.oy - tr.win.y));
     else if (tr.type === 'marquee') { const x = Math.min(m.x, tr.x0), y = Math.min(m.y, tr.y0); g.grayFrame(x, y, Math.abs(m.x - tr.x0) + 1, Math.abs(m.y - tr.y0) + 1); }
     else if (tr.type === 'icon') {
-      const o = this.iconOrigin(tr.win), dx = m.x - tr.x0, dy = m.y - tr.y0;
-      for (const it of tr.items) g.ghost(this.iconFor(it), o.x + it.x + dx, o.y + it.y + dy);
+      const dx = m.x - tr.x0, dy = m.y - tr.y0;
+      tr.items.forEach((it, k) => { const s = this.dragStart(tr, it, k); g.ghost(this.iconFor(it), s.x + dx, s.y + dy); });
       const tgt = this.dropTarget(m.x, m.y, tr.items);
-      if (tgt && tgt.item !== this.desk && !tgt.win) { const r = this.iconRectOf(tgt.item); if (r) g.blit(this.iconFor(tgt.item), r.x, r.y, 'invert'); }
+      if (tgt && tgt.item !== this.desk && !tgt.win) {
+        const r = this.iconRectOf(tgt.item);
+        if (r?.row) { const c = this.content(r.win); g.setClip(c.x, c.y, c.w, c.h); g.invert(r.row.x, r.row.y, r.row.w, r.row.h); g.noClip(); }
+        else if (r) g.blit(this.iconFor(tgt.item), r.x, r.y, 'invert');
+      }
     }
   }
   drawZoom(g, a) {

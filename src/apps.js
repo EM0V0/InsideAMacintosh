@@ -179,15 +179,20 @@ class NotePad {
   drag(lx, ly) { if (this.dragging) this.tb.caret = this.tb.hit(lx - 10, ly - 8); }
   up() { this.dragging = false; }
   key(key, mods, desk) {
-    const before = this.tb.text;
-    if (!this.tb.key(key)) return false;
-    if (this.tb.lines().length > this.rows) { this.tb.text = before; this.tb.caret = this.tb.anchor = before.length; desk.beep(); }
-    this.desk.notes[this.page] = this.tb.text;
+    if (!this.change(() => this.tb.key(key))) return false;
     return true;
+  }
+  // make an edit, undoing it with a beep if the page would overflow
+  change(fn) {
+    const { text, caret, anchor } = this.tb;
+    const r = fn();
+    if (this.tb.lines().length > this.rows) { Object.assign(this.tb, { text, caret, anchor }); this.desk.beep(); }
+    this.desk.notes[this.page] = this.tb.text;
+    return r;
   }
   cursor(lx, ly) { return ly < this.rows * 12 + 8 ? 'ibeam' : 'arrow'; }
   canEdit(cmd) { return cmd === 'paste' ? this.desk.clipboard?.type === 'text' : cmd === 'selectAll' || this.tb.hasSel(); }
-  edit(cmd, desk) { editCommon(this.tb, cmd, desk); this.desk.notes[this.page] = this.tb.text; }
+  edit(cmd, desk) { this.change(() => editCommon(this.tb, cmd, desk)); }
   close() { this.desk.notes[this.page] = this.tb.text; }
 }
 
@@ -440,6 +445,29 @@ const BRUSHES = [
   (g, x, y, p) => { for (let i = -4; i <= 4; i++) { g.fill(x + i, y - i, 2, 1, p); } },
 ];
 
+// OR the black pixels of a floating selection into a canvas-sized buffer
+function stamp(buf, f) {
+  for (let j = 0; j < f.h; j++) for (let i = 0; i < f.w; i++) {
+    const x = f.x + i, y = f.y + j;
+    if (x >= 0 && y >= 0 && x < CW && y < CH && f.bits[j * f.w + i]) buf[y * CW + x] = 1;
+  }
+}
+// is (i, j) of a selection rectangle part of the selection? (a lasso selection carries a mask)
+const inSel = (s, i, j) => !s.mask || s.mask[j * s.w + i] === 1;
+// even-odd scanline spans of a polygon for rows y0..y1: cb(y, left, right)
+function polySpans(pts, y0, y1, cb) {
+  for (let y = y0; y <= y1; y++) {
+    const xs = [];
+    for (let i = 0; i < pts.length; i++) {
+      const a = pts[i], b = pts[(i + 1) % pts.length];
+      if ((a.y <= y && b.y > y) || (b.y <= y && a.y > y)) xs.push(a.x + ((y - a.y) * (b.x - a.x)) / (b.y - a.y));
+    }
+    xs.sort((p, q) => p - q);
+    for (let i = 0; i + 1 < xs.length; i += 2) cb(y, Math.ceil(xs[i]), Math.floor(xs[i + 1]));
+  }
+}
+const span = (vals) => vals.reduce((r, v) => [Math.min(r[0], v), Math.max(r[1], v)], [Infinity, -Infinity]);
+
 export class PaintApp {
   constructor(desk, doc) {
     this.desk = desk; this.doc = doc; this.name = 'Paint';
@@ -448,50 +476,69 @@ export class PaintApp {
     this.cg = new Gfx(this.canvas, CW, CH, 1);
     this.tool = 'pencil'; this.pat = PAT.black; this.patIndex = 0; this.width = 0; this.brush = 0;
     this.undoBuf = null; this.dirtyDoc = false; this.grid = false; this.fat = null;
-    this.sel = null; this.float = null; this.text = null; this.poly = null; this.lastToolClick = { t: -9, tool: null };
+    this.sel = null; this.float = null; this.text = null; this.poly = null; this.path = null; this.lastToolClick = { t: -9, tool: null };
     this.title = doc ? doc.name : 'untitled';
+    // the document window; the desktop tracks clicks in its close box
+    this.win = { ...PAINT_WIN, title: this.title, closable: true };
   }
   menus() {
     const d = this.desk, sel = !!this.sel;
     return [
       { title: 'File', items: [
-        { label: 'New', action: () => this.confirm(() => { this.canvas.fill(0); this.doc = null; this.title = 'untitled'; this.dirtyDoc = false; }) },
-        { label: 'Close', action: () => this.confirm(() => d.quitApp()) },
+        { label: 'New', action: () => this.confirm(() => { this.doc = null; this.title = 'untitled'; this.load(null); }) },
+        { label: 'Close', action: () => this.close() },
         { label: 'Save', key: 'S', action: () => this.save() },
-        { label: 'Save As…', enabled: false }, { label: 'Revert', enabled: () => !!this.doc && this.dirtyDoc, action: () => { this.canvas.set(this.doc.bitmap); this.dirtyDoc = false; } }, '-',
+        { label: 'Save As…', enabled: false }, { label: 'Revert', enabled: () => !!this.doc && this.dirtyDoc, action: () => this.load(this.doc.bitmap) }, '-',
         { label: 'Print…', enabled: false }, '-',
-        { label: 'Quit', key: 'Q', action: () => this.confirm(() => d.quitApp()) },
+        { label: 'Quit', key: 'Q', action: () => this.close() },
       ] },
       { title: 'Edit', items: [
         { label: 'Undo', key: 'Z', enabled: () => !!this.undoBuf, action: () => this.undo() }, '-',
-        { label: 'Cut', key: 'X', enabled: () => sel, action: () => { this.copySel(); this.fillSel(PAT.white); } },
+        { label: 'Cut', key: 'X', enabled: () => sel, action: () => { this.snapshot(); this.copySel(); this.fillSel(PAT.white); } },
         { label: 'Copy', key: 'C', enabled: () => sel, action: () => this.copySel() },
         { label: 'Paste', key: 'V', enabled: () => d.clipboard?.type === 'picture', action: () => this.paste() },
-        { label: 'Clear', enabled: () => true, action: () => { this.commit(); this.snapshot(); if (this.sel) this.fillSel(PAT.white); else this.canvas.fill(0); this.dirtyDoc = true; } }, '-',
-        { label: 'Invert', enabled: () => true, action: () => { this.snapshot(); const r = this.sel || { x: 0, y: 0, w: CW, h: CH }; this.cg.invert(r.x, r.y, r.w, r.h); this.dirtyDoc = true; } },
+        { label: 'Clear', enabled: () => true, action: () => { if (this.sel) { this.snapshot(); this.fillSel(PAT.white); } else { this.commit(); this.snapshot(); this.canvas.fill(0); this.dirtyDoc = true; } } }, '-',
+        { label: 'Invert', enabled: () => true, action: () => { this.commit(); this.snapshot(); this.paintSel((v) => v ^ 1); } },
         { label: 'Fill', enabled: () => sel, action: () => { this.snapshot(); this.fillSel(this.pat); } },
       ] },
       { title: 'Goodies', items: [
         { label: 'Grid', check: () => this.grid, action: () => { this.grid = !this.grid; } },
         { label: 'FatBits', check: () => !!this.fat, action: () => this.toggleFat(CW / 2, CH / 2) },
-        { label: 'Brush Shape', action: () => { this.brush = (this.brush + 1) % BRUSHES.length; this.tool = 'brush'; } },
+        { label: 'Brush Shape', action: () => { this.commit(); this.sel = null; this.brush = (this.brush + 1) % BRUSHES.length; this.tool = 'brush'; } },
         { label: 'Introduction', action: () => d.alert('note', ['Choose a tool on the left and a pattern', 'below, then draw in the window.', 'Double-click the eraser to erase all;', 'double-click the pencil for FatBits.'], ['OK']) },
       ] },
     ];
   }
   about() { this.desk.alert('note', ['Paint', 'A small painting program for this', 're-created desktop.'], ['OK']); }
+  // File > Close, Quit and the window's close box: offer to save, then back to the Finder
+  close() { this.confirm(() => this.desk.quitApp()); }
   confirm(then) {
     this.commit();
     if (!this.dirtyDoc) return then();
-    this.desk.alert('caution', [`Save changes to “${this.title}”?`], ['Cancel', 'No', 'Yes'], (b) => { if (b === 'Yes') { this.save(); then(); } else if (b === 'No') then(); });
+    this.desk.alert('caution', [`Save changes to “${this.title}”?`], ['Cancel', 'No', 'Yes'], (b) => { if (b === 'Yes') { if (this.save()) then(); } else if (b === 'No') then(); });
   }
   save() {
     this.commit();
     const it = this.desk.saveDocument('paint', 'Painting', { bitmap: this.canvas.slice() }, this.doc);
+    if (!it) return false;
     this.doc = it; this.title = it.name; this.dirtyDoc = false;
+    return true;
   }
-  snapshot() { this.undoBuf = this.canvas.slice(); }
-  undo() { if (!this.undoBuf) return; const cur = this.canvas.slice(); this.canvas.set(this.undoBuf); this.undoBuf = cur; this.sel = null; }
+  // start over with a picture (or a blank page): nothing selected, floating, typed or undoable
+  load(bitmap) {
+    if (bitmap) this.canvas.set(bitmap); else this.canvas.fill(0);
+    this.sel = this.float = this.text = this.poly = this.path = null;
+    this.mode = null; this.drag0 = null; this.undoBuf = null; this.dirtyDoc = false;
+  }
+  // what Undo goes back to: the picture as it looks now, including anything floating
+  snapshot() { const b = this.canvas.slice(); if (this.float) stamp(b, this.float); this.undoBuf = b; }
+  undo() {
+    if (!this.undoBuf) return;
+    const cur = this.canvas.slice(); if (this.float) stamp(cur, this.float);
+    this.canvas.set(this.undoBuf); this.undoBuf = cur;
+    this.sel = this.float = this.text = this.poly = this.path = null;
+    this.dirtyDoc = true;
+  }
   content() { return { x: PAINT_WIN.x + 1, y: PAINT_WIN.y + TB, w: CW, h: CH }; }
   toCanvas(x, y) {
     const c = this.content();
@@ -510,9 +557,9 @@ export class PaintApp {
       const dbl = d.t - this.lastToolClick.t < 0.45 && this.lastToolClick.tool === t;
       this.lastToolClick = { t: d.t, tool: t };
       this.commit();
+      if (t !== 'select' && t !== 'lasso') this.sel = null;
       if (dbl && t === 'eraser') { this.snapshot(); this.canvas.fill(0); this.dirtyDoc = true; }
       if (dbl && t === 'pencil') this.toggleFat(CW / 2, CH / 2);
-      if (t === 'hand' || t === 'lasso') { this.tool = t === 'lasso' ? 'select' : 'hand'; return; }
       this.tool = t; return;
     }
     if (hit(x, y, 8, 232, 72, 58)) { this.width = Math.max(0, Math.min(4, Math.floor((y - 234) / 11))); return; }
@@ -522,48 +569,66 @@ export class PaintApp {
     const p = this.toCanvas(x, y);
     this.drag0 = p; this.last = p;
     if (this.fat) {
+      // the hand moves the magnified view; any other tool flips pixels
+      if (this.tool === 'hand') { this.mode = 'hand'; this.handFrom = { x, y, fx: this.fat.x, fy: this.fat.y }; return; }
+      if (x - c.x < 58 && y - c.y < 37) { this.drag0 = null; return; } // the actual-size view in the corner hides those cells
+      this.commit(); this.sel = null;
       this.snapshot(); this.fatInk = this.cg.get(p.x, p.y) ? 0 : 1; this.cg.px(p.x, p.y, this.fatInk); this.dirtyDoc = true; this.mode = 'fat'; return;
     }
     const t = this.tool;
-    if (t !== 'text') this.commit();
-    if (t === 'select') {
-      if (this.sel && hit(p.x, p.y, this.sel.x, this.sel.y, this.sel.w, this.sel.h)) { this.liftSelection(); this.mode = 'moveSel'; this.selOff = { x: p.x - this.float.x, y: p.y - this.float.y }; return; }
-      this.sel = null; this.mode = 'select'; return;
+    if (t === 'select' || t === 'lasso') {
+      const s = this.sel;
+      if (s && hit(p.x, p.y, s.x, s.y, s.w, s.h)) { this.commit(); this.liftSelection(); this.mode = 'moveSel'; this.selOff = { x: p.x - this.float.x, y: p.y - this.float.y }; return; }
+      this.commit(); this.sel = null;
+      if (t === 'lasso') { this.path = [p]; this.mode = 'lasso'; } else this.mode = 'select';
+      return;
     }
-    if (t === 'hand') { this.mode = 'hand'; return; }
-    if (t === 'text') { this.commit(); this.text = { x: p.x, y: p.y - 6, s: '' }; return; }
-    this.snapshot(); this.dirtyDoc = true;
-    const g = this.cg, pen = WIDTHS[this.width];
-    if (t === 'pencil') { this.ink = g.get(p.x, p.y) ? 0 : 1; g.px(p.x, p.y, this.ink); this.mode = 'pencil'; return; }
-    if (t === 'brush') { BRUSHES[this.brush](g, p.x, p.y, this.pat); this.mode = 'brush'; return; }
-    if (t === 'eraser') { g.fill(p.x - 8, p.y - 8, 16, 16, PAT.white); this.mode = 'eraser'; return; }
-    if (t === 'spray') { this.spray(p); this.mode = 'spray'; return; }
-    if (t === 'bucket') { this.flood(p.x, p.y); this.mode = null; return; }
+    // every other tool puts down whatever is floating and drops the selection;
+    // a polygon in progress stays open while the polygon tool adds corners to it
+    if (!((t === 'poly' || t === 'fpoly') && this.poly)) this.commit();
+    this.sel = null;
+    if (t === 'hand') { this.mode = 'hand'; return; } // the page is the size of the window: nothing to scroll
+    if (t === 'text') { this.text = { x: p.x, y: p.y - 6, s: '' }; return; }
     if (t === 'poly' || t === 'fpoly') {
       if (!this.poly) this.poly = [p];
       else {
         const s = this.poly[0];
+        // click on the first corner, or double-click, to finish
         if ((Math.abs(p.x - s.x) < 4 && Math.abs(p.y - s.y) < 4) || d.t - (this.polyT || 0) < 0.4) { this.finishPoly(); this.mode = null; return; }
         this.poly.push(p);
       }
       this.polyT = d.t; this.mode = null; return;
     }
+    this.snapshot(); this.dirtyDoc = true;
+    const g = this.cg;
+    if (t === 'pencil') { this.ink = g.get(p.x, p.y) ? 0 : 1; g.px(p.x, p.y, this.ink); this.mode = 'pencil'; return; }
+    if (t === 'brush') { BRUSHES[this.brush](g, p.x, p.y, this.pat); this.mode = 'brush'; return; }
+    if (t === 'eraser') { g.fill(p.x - 8, p.y - 8, 16, 16, PAT.white); this.mode = 'eraser'; return; }
+    if (t === 'spray') { this.spray(p); this.mode = 'spray'; return; }
+    if (t === 'bucket') { this.flood(p.x, p.y); this.mode = null; return; }
     if (t === 'free' || t === 'ffree') { this.path = [p]; this.mode = 'free'; return; }
-    this.mode = 'shape'; void pen;
+    this.mode = 'shape';
   }
   move(x, y) { this.hover = { x, y }; }
   drag(x, y, mods) {
+    this.hover = { x, y };
+    if (this.mode === 'hand') {
+      const h = this.handFrom;
+      if (this.fat && h) {
+        this.fat.x = Math.max(0, Math.min(CW - 52, h.fx - Math.round((x - h.x) / 8)));
+        this.fat.y = Math.max(0, Math.min(CH - 31, h.fy - Math.round((y - h.y) / 8)));
+      }
+      return;
+    }
     const p = this.toCanvas(x, y), g = this.cg;
     const a = this.last || p;
-    this.hover = { x, y };
-    if (this.mode === 'fat') { g.px(p.x, p.y, this.fatInk); }
+    if (this.mode === 'fat') g.line(a.x, a.y, p.x, p.y, this.fatInk);
     else if (this.mode === 'pencil') g.line(a.x, a.y, p.x, p.y, this.ink);
     else if (this.mode === 'brush') { const n = Math.max(1, Math.ceil(Math.hypot(p.x - a.x, p.y - a.y) / 2)); for (let i = 1; i <= n; i++) BRUSHES[this.brush](g, Math.round(a.x + ((p.x - a.x) * i) / n), Math.round(a.y + ((p.y - a.y) * i) / n), this.pat); }
     else if (this.mode === 'eraser') { const n = Math.max(1, Math.ceil(Math.hypot(p.x - a.x, p.y - a.y) / 4)); for (let i = 1; i <= n; i++) g.fill(Math.round(a.x + ((p.x - a.x) * i) / n) - 8, Math.round(a.y + ((p.y - a.y) * i) / n) - 8, 16, 16, PAT.white); }
     else if (this.mode === 'spray') this.spray(p);
-    else if (this.mode === 'free') this.path.push(p);
-    else if (this.mode === 'moveSel') { this.float.x = p.x - this.selOff.x; this.float.y = p.y - this.selOff.y; this.sel = { x: this.float.x, y: this.float.y, w: this.float.w, h: this.float.h }; }
-    else if (this.mode === 'hand') { /* the document is the size of the window: nothing to scroll */ }
+    else if ((this.mode === 'free' || this.mode === 'lasso') && this.path) this.path.push(p);
+    else if (this.mode === 'moveSel') { this.float.x = p.x - this.selOff.x; this.float.y = p.y - this.selOff.y; this.sel = { ...this.sel, x: this.float.x, y: this.float.y }; }
     this.last = p;
   }
   up(x, y) {
@@ -574,8 +639,12 @@ export class PaintApp {
       if (t === 'line') g.line(a.x, a.y, p.x, p.y, 1, pen);
       else if (r.w > 1 && r.h > 1) this.shape(g, t, r, pen);
     } else if (this.mode === 'select' && a) {
-      const r = { x: Math.max(0, Math.min(a.x, p.x)), y: Math.max(0, Math.min(a.y, p.y)), w: Math.abs(p.x - a.x) + 1, h: Math.abs(p.y - a.y) + 1 };
-      this.sel = r.w > 2 && r.h > 2 ? r : null;
+      // the selection never reaches past the edges of the picture
+      const cx = (v) => Math.max(0, Math.min(CW - 1, v)), cy = (v) => Math.max(0, Math.min(CH - 1, v));
+      const x0 = cx(Math.min(a.x, p.x)), x1 = cx(Math.max(a.x, p.x)), y0 = cy(Math.min(a.y, p.y)), y1 = cy(Math.max(a.y, p.y));
+      this.sel = x1 - x0 >= 2 && y1 - y0 >= 2 ? { x: x0, y: y0, w: x1 - x0 + 1, h: y1 - y0 + 1 } : null;
+    } else if (this.mode === 'lasso' && this.path) {
+      this.path.push(p); this.makeLasso(this.path); this.path = null;
     } else if (this.mode === 'free' && this.path) {
       const filled = this.tool === 'ffree';
       if (filled) this.fillPoly(this.path, this.pat);
@@ -583,7 +652,7 @@ export class PaintApp {
       if (filled) g.line(this.path[this.path.length - 1].x, this.path[this.path.length - 1].y, this.path[0].x, this.path[0].y, 1, pen);
       this.path = null;
     }
-    this.mode = null; this.drag0 = null; this.last = null;
+    this.mode = null; this.drag0 = null; this.last = null; this.handFrom = null;
   }
   key(key, mods) {
     if (this.text) {
@@ -626,16 +695,8 @@ export class PaintApp {
   }
   fillPoly(pts, pat) {
     if (pts.length < 3) return;
-    const ys = pts.map((p) => p.y), y0 = Math.max(0, Math.min(...ys)), y1 = Math.min(CH - 1, Math.max(...ys));
-    for (let y = y0; y <= y1; y++) {
-      const xs = [];
-      for (let i = 0; i < pts.length; i++) {
-        const a = pts[i], b = pts[(i + 1) % pts.length];
-        if ((a.y <= y && b.y > y) || (b.y <= y && a.y > y)) xs.push(a.x + ((y - a.y) * (b.x - a.x)) / (b.y - a.y));
-      }
-      xs.sort((p, q) => p - q);
-      for (let i = 0; i + 1 < xs.length; i += 2) for (let x = Math.ceil(xs[i]); x <= Math.floor(xs[i + 1]); x++) this.cg.px(x, y, (pat[y & 7] >> (7 - (x & 7))) & 1);
-    }
+    const [lo, hi] = span(pts.map((p) => p.y));
+    polySpans(pts, Math.max(0, lo), Math.min(CH - 1, hi), (y, xa, xb) => { for (let x = xa; x <= xb; x++) this.cg.px(x, y, (pat[y & 7] >> (7 - (x & 7))) & 1); });
   }
   finishPoly() {
     const pts = this.poly; this.poly = null;
@@ -646,33 +707,65 @@ export class PaintApp {
     for (let i = 1; i < pts.length; i++) this.cg.line(pts[i - 1].x, pts[i - 1].y, pts[i].x, pts[i].y, 1, pen);
     this.cg.line(pts[pts.length - 1].x, pts[pts.length - 1].y, pts[0].x, pts[0].y, 1, pen);
   }
+  // the lasso selects the area inside the drawn loop, provided it holds some ink
+  makeLasso(pts) {
+    if (pts.length < 3) return;
+    const [lx, hx] = span(pts.map((q) => q.x)), [ly, hy] = span(pts.map((q) => q.y));
+    const x0 = Math.max(0, lx), x1 = Math.min(CW - 1, hx), y0 = Math.max(0, ly), y1 = Math.min(CH - 1, hy);
+    if (x1 - x0 < 2 || y1 - y0 < 2) return;
+    const w = x1 - x0 + 1, h = y1 - y0 + 1, mask = new Uint8Array(w * h);
+    const rel = pts.map((q) => ({ x: q.x - x0, y: q.y - y0 }));
+    polySpans(rel, 0, h - 1, (y, xa, xb) => { for (let x = Math.max(0, xa); x <= Math.min(w - 1, xb); x++) mask[y * w + x] = 1; });
+    const mg = new Gfx(mask, w, h, 1);
+    for (let i = 0; i < rel.length; i++) { const u = rel[i], v = rel[(i + 1) % rel.length]; mg.line(u.x, u.y, v.x, v.y, 1); }
+    let ink = false;
+    for (let j = 0; j < h && !ink; j++) for (let i = 0; i < w; i++) if (mask[j * w + i] && this.canvas[(y0 + j) * CW + x0 + i]) { ink = true; break; }
+    if (ink) this.sel = { x: x0, y: y0, w, h, mask };
+  }
   liftSelection() {
     if (this.float) return;
     const s = this.sel; this.snapshot();
     const bits = new Uint8Array(s.w * s.h);
-    for (let j = 0; j < s.h; j++) for (let i = 0; i < s.w; i++) { const x = s.x + i, y = s.y + j; if (x < CW && y < CH) { bits[j * s.w + i] = this.canvas[y * CW + x]; this.canvas[y * CW + x] = 0; } }
+    for (let j = 0; j < s.h; j++) for (let i = 0; i < s.w; i++) {
+      const x = s.x + i, y = s.y + j;
+      if (x < 0 || y < 0 || x >= CW || y >= CH || !inSel(s, i, j)) continue;
+      bits[j * s.w + i] = this.canvas[y * CW + x]; this.canvas[y * CW + x] = 0;
+    }
     this.float = { x: s.x, y: s.y, w: s.w, h: s.h, bits };
     this.dirtyDoc = true;
   }
   commit() {
-    if (this.float) {
-      const f = this.float;
-      for (let j = 0; j < f.h; j++) for (let i = 0; i < f.w; i++) { const x = f.x + i, y = f.y + j; if (x >= 0 && y >= 0 && x < CW && y < CH && f.bits[j * f.w + i]) this.canvas[y * CW + x] = 1; }
-      this.float = null;
-    }
+    if (this.float) { stamp(this.canvas, this.float); this.float = null; }
     if (this.text) { if (this.text.s) { this.snapshot(); this.cg.text(this.text.s, this.text.x, this.text.y); this.dirtyDoc = true; } this.text = null; }
     if (this.poly) this.finishPoly();
   }
   copySel() {
     const s = this.sel; if (!s) return;
-    const bm = { w: s.w, h: s.h, data: new Uint8Array(s.w * s.h), mask: new Uint8Array(s.w * s.h).fill(1), edge: new Uint8Array(s.w * s.h) };
-    for (let j = 0; j < s.h; j++) for (let i = 0; i < s.w; i++) bm.data[j * s.w + i] = this.float ? this.float.bits[j * s.w + i] : this.canvas[(s.y + j) * CW + s.x + i] || 0;
+    const n = s.w * s.h, bm = { w: s.w, h: s.h, data: new Uint8Array(n), mask: new Uint8Array(n).fill(1), edge: new Uint8Array(n) };
+    for (let j = 0; j < s.h; j++) for (let i = 0; i < s.w; i++) {
+      if (!inSel(s, i, j)) continue;
+      const x = s.x + i, y = s.y + j;
+      bm.data[j * s.w + i] = this.float ? this.float.bits[j * s.w + i] : x >= 0 && y >= 0 && x < CW && y < CH ? this.canvas[y * CW + x] : 0;
+    }
     this.desk.clipboard = { type: 'picture', bm };
   }
+  // apply fn to every pixel inside the selection, or to the whole picture when nothing is selected
+  paintSel(fn) {
+    const s = this.sel || { x: 0, y: 0, w: CW, h: CH };
+    for (let j = 0; j < s.h; j++) for (let i = 0; i < s.w; i++) {
+      const x = s.x + i, y = s.y + j;
+      if (x < 0 || y < 0 || x >= CW || y >= CH || !inSel(s, i, j)) continue;
+      this.canvas[y * CW + x] = fn(this.canvas[y * CW + x], x, y);
+    }
+    this.dirtyDoc = true;
+  }
   fillSel(pat) {
-    const s = this.sel; if (!s) return;
-    if (this.float) { this.float = null; }
-    this.cg.fill(s.x, s.y, s.w, s.h, pat); this.dirtyDoc = true;
+    if (!this.sel) return;
+    const floating = !!this.float;
+    this.float = null;
+    // a floating (moved or pasted) selection is just taken away; otherwise the selected area is painted
+    if (!(floating && pat === PAT.white)) this.paintSel((v, x, y) => (pat[y & 7] >> (7 - (x & 7))) & 1);
+    this.dirtyDoc = true;
     if (pat === PAT.white) this.sel = null;
   }
   paste() {
@@ -692,7 +785,7 @@ export class PaintApp {
       const cx = 8 + (i % 2) * 36, cy = 24 + Math.floor(i / 2) * 20;
       g.frame(cx, cy, 37, 21);
       const ic = TOOL_ICONS[t]; g.blit(ic, cx + Math.round((37 - ic.w) / 2), cy + Math.round((21 - ic.h) / 2));
-      if (t === this.tool || (t === 'lasso' && false)) g.invert(cx + 1, cy + 1, 35, 19);
+      if (t === this.tool) g.invert(cx + 1, cy + 1, 35, 19);
     });
     // line widths
     g.clear(8, 232, 73, 58); g.frame(8, 232, 73, 58);
@@ -702,8 +795,8 @@ export class PaintApp {
     g.fill(10, 298, 76, 39, this.pat); g.frame(10, 298, 76, 39); g.vline(88, 296, 338);
     PATTERNS.forEach((p, i) => { const x = 92 + (i % 12) * 34, y = 297 + Math.floor(i / 12) * 20; g.fill(x, y, 33, 20, p); g.frame(x, y, 34, 21); });
     // document window
-    const win = { ...PAINT_WIN, title: this.fat ? `${this.title} (FatBits)` : this.title, closable: true };
-    d.drawWindowFrame(g, win, d.appFocused());
+    this.win.title = this.fat ? `${this.title} (FatBits)` : this.title;
+    d.drawWindowFrame(g, this.win, d.appFocused());
     const c = this.content();
     g.setClip(c.x, c.y, c.w, c.h);
     if (this.fat) {
@@ -720,14 +813,33 @@ export class PaintApp {
       this.drawPreview(g, c);
     }
     g.noClip();
-    if (this.closeHint) void 0;
+  }
+  // marching ants around the selection: its rectangle, or the outline of a lasso selection
+  drawAnts(g, c, s, phase) {
+    g.xor = true;
+    if (!s.mask) {
+      for (let i = 0; i < s.w; i++) { if (((i + phase) & 3) < 2) { g.px(c.x + s.x + i, c.y + s.y); g.px(c.x + s.x + i, c.y + s.y + s.h - 1); } }
+      for (let j = 1; j < s.h - 1; j++) { if (((j + phase) & 3) < 2) { g.px(c.x + s.x, c.y + s.y + j); g.px(c.x + s.x + s.w - 1, c.y + s.y + j); } }
+    } else {
+      const m = s.mask, w = s.w;
+      for (let j = 0; j < s.h; j++) for (let i = 0; i < w; i++) {
+        if (!m[j * w + i] || ((i + j + phase) & 3) >= 2) continue;
+        if (i === 0 || j === 0 || i === w - 1 || j === s.h - 1 || !m[j * w + i - 1] || !m[j * w + i + 1] || !m[(j - 1) * w + i] || !m[(j + 1) * w + i]) g.px(c.x + s.x + i, c.y + s.y + j);
+      }
+    }
+    g.xor = false;
   }
   drawPreview(g, c) {
     const d = this.desk, m = d.mouse;
-    if (this.sel) { const s = this.sel; const phase = Math.floor(d.t * 8) & 3; g.xor = true; for (let i = 0; i < s.w; i++) { if (((i + phase) & 3) < 2) { g.px(c.x + s.x + i, c.y + s.y); g.px(c.x + s.x + i, c.y + s.y + s.h - 1); } } for (let j = 1; j < s.h - 1; j++) { if (((j + phase) & 3) < 2) { g.px(c.x + s.x, c.y + s.y + j); g.px(c.x + s.x + s.w - 1, c.y + s.y + j); } } g.xor = false; }
+    if (this.sel) this.drawAnts(g, c, this.sel, Math.floor(d.t * 8) & 3);
     if (this.text) { g.text(this.text.s, c.x + this.text.x, c.y + this.text.y); if (d.caretOn) { const tx = c.x + this.text.x + (this.text.s ? textWidth(this.text.s) + 1 : 0); g.vline(tx, c.y + this.text.y - 1, c.y + this.text.y + 10); } }
     if (this.poly) { const P = this.poly; for (let i = 1; i < P.length; i++) g.line(c.x + P[i - 1].x, c.y + P[i - 1].y, c.x + P[i].x, c.y + P[i].y); const p = this.toCanvas(m.x, m.y); const l = P[P.length - 1]; g.line(c.x + l.x, c.y + l.y, c.x + p.x, c.y + p.y); }
-    if (this.path) { const P = this.path; for (let i = 1; i < P.length; i++) g.line(c.x + P[i - 1].x, c.y + P[i - 1].y, c.x + P[i].x, c.y + P[i].y); }
+    if (this.path) {
+      const P = this.path, lasso = this.mode === 'lasso';
+      if (lasso) g.xor = true; // the lasso's loop is drawn dotted
+      for (let i = 1; i < P.length; i++) g.line(c.x + P[i - 1].x, c.y + P[i - 1].y, c.x + P[i].x, c.y + P[i].y, 1, 1, lasso ? PAT.gray : null);
+      g.xor = false;
+    }
     if (!this.drag0 || !d.mouse.down) return;
     const a = this.drag0, p = this.toCanvas(m.x, m.y);
     const r = { x: c.x + Math.min(a.x, p.x), y: c.y + Math.min(a.y, p.y), w: Math.abs(p.x - a.x) + 1, h: Math.abs(p.y - a.y) + 1 };
@@ -753,51 +865,72 @@ export class WriteApp {
     this.tb = new TextBox(doc?.text ?? '', 432, 13);
     this.tb.caret = this.tb.anchor = 0;
     this.dirtyDoc = false;
+    // the document window; the desktop tracks clicks in its close box
+    this.win = { ...WRITE_WIN, title: this.title, closable: true };
   }
   get rows() { return Math.floor((WRITE_WIN.h - TB - 30 - 6) / 13); }
+  maxScroll() { return Math.max(0, this.tb.lines().length - this.rows); }
+  // keep the view inside the text and the caret on screen
+  settle() { this.tb.scroll = Math.max(0, Math.min(this.tb.scroll, this.maxScroll())); this.tb.ensureVisible(this.rows); }
+  edit(cmd) { const before = this.tb.text; editCommon(this.tb, cmd, this.desk); if (this.tb.text !== before) { this.dirtyDoc = true; this.settle(); } }
   menus() {
     const d = this.desk, tb = this.tb;
     return [
       { title: 'File', items: [
         { label: 'New', action: () => this.confirm(() => { this.doc = null; this.title = 'Untitled'; this.tb = new TextBox('', 432, 13); this.dirtyDoc = false; }) },
-        { label: 'Close', action: () => this.confirm(() => d.quitApp()) },
+        { label: 'Close', action: () => this.close() },
         { label: 'Save', key: 'S', action: () => this.save() },
         { label: 'Save As…', enabled: false }, '-',
         { label: 'Print…', enabled: false }, '-',
-        { label: 'Quit', key: 'Q', action: () => this.confirm(() => d.quitApp()) },
+        { label: 'Quit', key: 'Q', action: () => this.close() },
       ] },
       { title: 'Edit', items: [
         { label: 'Undo', key: 'Z', enabled: false }, '-',
-        { label: 'Cut', key: 'X', enabled: () => tb.hasSel(), action: () => { editCommon(tb, 'cut', d); this.dirtyDoc = true; } },
-        { label: 'Copy', key: 'C', enabled: () => tb.hasSel(), action: () => editCommon(tb, 'copy', d) },
-        { label: 'Paste', key: 'V', enabled: () => d.clipboard?.type === 'text', action: () => { editCommon(tb, 'paste', d); this.dirtyDoc = true; } },
-        { label: 'Clear', enabled: () => tb.hasSel(), action: () => { editCommon(tb, 'clear', d); this.dirtyDoc = true; } },
-        { label: 'Select All', key: 'A', action: () => editCommon(tb, 'selectAll', d) },
+        { label: 'Cut', key: 'X', enabled: () => tb.hasSel(), action: () => this.edit('cut') },
+        { label: 'Copy', key: 'C', enabled: () => tb.hasSel(), action: () => this.edit('copy') },
+        { label: 'Paste', key: 'V', enabled: () => d.clipboard?.type === 'text', action: () => this.edit('paste') },
+        { label: 'Clear', enabled: () => tb.hasSel(), action: () => this.edit('clear') },
+        { label: 'Select All', key: 'A', action: () => this.edit('selectAll') },
       ] },
       { title: 'Search', items: [{ label: 'Find…', key: 'F', enabled: false }, { label: 'Change…', enabled: false }] },
       { title: 'Format', items: [{ label: 'Show Ruler', check: () => true, enabled: false }, { label: 'Insert Page Break', enabled: false }] },
     ];
   }
   about() { this.desk.alert('note', ['Write', 'A small word processor for this', 're-created desktop.'], ['OK']); }
+  // File > Close, Quit and the window's close box: offer to save, then back to the Finder
+  close() { this.confirm(() => this.desk.quitApp()); }
   confirm(then) {
     if (!this.dirtyDoc) return then();
-    this.desk.alert('caution', [`Save changes to “${this.title}”?`], ['Cancel', 'No', 'Yes'], (b) => { if (b === 'Yes') { this.save(); then(); } else if (b === 'No') then(); });
+    this.desk.alert('caution', [`Save changes to “${this.title}”?`], ['Cancel', 'No', 'Yes'], (b) => { if (b === 'Yes') { if (this.save()) then(); } else if (b === 'No') then(); });
   }
-  save() { const it = this.desk.saveDocument('write', 'Untitled Document', { text: this.tb.text }, this.doc); this.doc = it; this.title = it.name; this.dirtyDoc = false; }
+  save() {
+    const it = this.desk.saveDocument('write', 'Untitled Document', { text: this.tb.text }, this.doc);
+    if (!it) return false;
+    this.doc = it; this.title = it.name; this.dirtyDoc = false;
+    return true;
+  }
   area() { return { x: WRITE_WIN.x + 1 + 24, y: WRITE_WIN.y + TB + 34, w: 440, h: this.rows * 13 }; }
   down(x, y) {
     const a = this.area();
     const sx = WRITE_WIN.x + WRITE_WIN.w - 16;
-    if (x >= sx && y >= WRITE_WIN.y + TB) { const max = Math.max(0, this.tb.lines().length - this.rows); if (y < WRITE_WIN.y + TB + 16) this.tb.scroll = Math.max(0, this.tb.scroll - 1); else if (y > WRITE_WIN.y + WRITE_WIN.h - 17) this.tb.scroll = Math.min(max, this.tb.scroll + 1); else this.tb.scroll = Math.min(max, Math.round(((y - WRITE_WIN.y - TB - 16) / (WRITE_WIN.h - TB - 34)) * max)); return; }
+    if (x >= sx && y >= WRITE_WIN.y + TB) { const max = this.maxScroll(); if (y < WRITE_WIN.y + TB + 16) this.tb.scroll = Math.max(0, this.tb.scroll - 1); else if (y > WRITE_WIN.y + WRITE_WIN.h - 17) this.tb.scroll = Math.min(max, this.tb.scroll + 1); else this.tb.scroll = Math.min(max, Math.round(((y - WRITE_WIN.y - TB - 16) / (WRITE_WIN.h - TB - 34)) * max)); return; }
     if (!hit(x, y, a.x - 20, a.y - 4, a.w + 30, a.h + 8)) return;
     this.tb.caret = this.tb.anchor = this.tb.hit(x - a.x, y - a.y); this.selecting = true;
   }
-  drag(x, y) { if (!this.selecting) return; const a = this.area(); this.tb.caret = this.tb.hit(x - a.x, Math.max(-13, Math.min(a.h, y - a.y))); }
+  drag(x, y) {
+    if (!this.selecting) return;
+    const a = this.area();
+    // dragging past the top or bottom of the text scrolls it
+    if (y < a.y && this.tb.scroll > 0) this.tb.scroll--;
+    else if (y >= a.y + a.h && this.tb.scroll < this.maxScroll()) this.tb.scroll++;
+    this.tb.caret = this.tb.hit(x - a.x, Math.max(-13, Math.min(a.h, y - a.y)));
+  }
   up() { this.selecting = false; }
-  key(key) { if (!this.tb.key(key)) return false; this.dirtyDoc = true; this.tb.ensureVisible(this.rows); return true; }
+  key(key) { const before = this.tb.text; if (!this.tb.key(key)) return false; if (this.tb.text !== before) this.dirtyDoc = true; this.settle(); return true; }
   cursor(x, y) { const a = this.area(); return hit(x, y, a.x - 20, a.y - 4, a.w + 30, a.h + 8) ? 'ibeam' : 'arrow'; }
   draw(g) {
-    const d = this.desk, win = { ...WRITE_WIN, title: this.title, closable: true };
+    const d = this.desk, win = this.win;
+    win.title = this.title;
     d.drawWindowFrame(g, win, d.appFocused());
     const x0 = WRITE_WIN.x + 1, y0 = WRITE_WIN.y + TB;
     // ruler
@@ -831,4 +964,4 @@ Things to try:
 - Drag a document onto the Trash, then choose Empty Trash from the Special menu.
 - Change the desktop pattern in the Control Panel, then click the preview.
 
-You can type in this document. Choose Quit from the File menu to go back to the Finder.`;
+You can type in this document. Click the close box, or choose Quit from the File menu, to go back to the Finder.`;
